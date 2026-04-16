@@ -17,6 +17,9 @@ What it does:
         – animated softmax probability bars
         – raw logit values
         – ground-truth label
+        – an explainability heatmap fading in on each model's panel
+          (Grad-CAM for the CNN, attention rollout for the ViT) showing
+          *where* on the mushroom the model looked to make its call
   • dangerous outcomes (predicted EDIBLE when actually POISONOUS) are
     flagged in red so the demo audience immediately sees the failure mode
 
@@ -44,6 +47,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from mushroomCNN import MushroomCNN
 from mushroomVIT import MushroomVIT
+
+# Reuse the explainability primitives from the stand-alone explain script
+from mushroom_explain import (
+    GradCAM,
+    vit_forward_with_attn,
+    attention_rollout,
+    overlay_heatmap,
+)
 
 
 IMG_DISPLAY_SIZE = 380   # pixels for the on-screen image
@@ -94,26 +105,60 @@ def reproduce_test_split(data_dir, img_size, seed):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Inferencer:
+    """
+    Runs a model on a PIL image and returns the class logits, softmax
+    probabilities, and an explainability heatmap overlay ready to display.
+
+    For the CNN: Grad-CAM at the final conv stage.
+    For the ViT: attention rollout over all encoder blocks.
+    """
     def __init__(self, cnn, vit, device, img_size):
         self.cnn = cnn
         self.vit = vit
         self.device = device
+        self.img_size = img_size
         self.tf = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
+        # Grad-CAM hook is attached once; the hook handles are persistent
+        self.gradcam = GradCAM(cnn, cnn.features)
+
+    def _img_array(self, pil_img):
+        """Resized image as a float [0, 1] numpy RGB array — the base for
+        heatmap overlay."""
+        resized = pil_img.resize((self.img_size, self.img_size))
+        return np.array(resized).astype(np.float32) / 255.0
+
+    @staticmethod
+    def _softmax(logits):
+        e = np.exp(logits - logits.max())
+        return e / e.sum()
+
+    def cnn_predict(self, pil_img):
+        x = self.tf(pil_img).unsqueeze(0).to(self.device)
+        cam, logits, _pred = self.gradcam(x)            # Grad-CAM forward + backward
+        probs = self._softmax(logits)
+        overlay = overlay_heatmap(self._img_array(pil_img), cam,
+                                    size=self.img_size)
+        return logits, probs, overlay
 
     @torch.no_grad()
-    def _infer(self, model, pil_img):
+    def vit_predict(self, pil_img):
         x = self.tf(pil_img).unsqueeze(0).to(self.device)
-        logits = model(x).cpu().numpy()[0]
-        e = np.exp(logits - logits.max())
-        probs = e / e.sum()
-        return logits, probs
+        logits_t, attns = vit_forward_with_attn(self.vit, x)
+        logits = logits_t.cpu().numpy()[0]
+        probs = self._softmax(logits)
+        roll = attention_rollout(attns, head_fusion="mean", discard_ratio=0.1)
+        overlay = overlay_heatmap(self._img_array(pil_img), roll,
+                                    size=self.img_size)
+        return logits, probs, overlay
 
-    def cnn_predict(self, pil_img): return self._infer(self.cnn, pil_img)
-    def vit_predict(self, pil_img): return self._infer(self.vit, pil_img)
+    def original_array(self, pil_img):
+        """Exposes the same [0, 1] resized image the overlay is built on, so
+        the UI can display the un-overlaid baseline in a heatmap panel."""
+        return self._img_array(pil_img)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +216,7 @@ class MushroomDemoApp:
     def _build_ui(self):
         self.root.title("Mushroom Toxicity Classifier — Live Demo")
         self.root.configure(bg=self.BG)
-        self.root.geometry("1100x680")
+        self.root.geometry("1240x740")
 
         title_font  = tkfont.Font(family="Helvetica", size=15, weight="bold")
         body_font   = tkfont.Font(family="Helvetica", size=11)
@@ -257,8 +302,12 @@ class MushroomDemoApp:
         )
 
     def _make_result_panel(self, parent, model_name, body_font, mono_font):
-        """Build a single model's result panel: header, prediction, softmax
-        bar chart (matplotlib), raw logits."""
+        """Build a single model's result panel.  Layout inside the panel:
+             [header with model name + prediction label]
+             [ heatmap thumbnail | softmax bar chart ]   ← shared figure
+             [raw logits in monospace]
+        Everything in the middle row lives on one matplotlib Figure so axes
+        can be laid out by gridspec and sized proportionally."""
         frame = Frame(parent, bg=self.PANEL_BG, bd=1, relief="solid")
 
         header = Frame(frame, bg=self.PANEL_BG)
@@ -270,24 +319,35 @@ class MushroomDemoApp:
                          font=("Helvetica", 13, "bold"), fg="#555")
         pred_lbl.pack(side="right")
 
-        # matplotlib bar chart for softmax probabilities
-        fig = Figure(figsize=(5.2, 1.6), dpi=100, facecolor=self.PANEL_BG)
-        ax = fig.add_subplot(111)
-        ax.set_facecolor(self.PANEL_BG)
-        ax.set_xlim(0, 1.0)
-        ax.set_yticks(range(len(self.class_names)))
-        ax.set_yticklabels(self.class_names)
-        ax.set_xlabel("softmax probability")
+        # ── combined figure: left column is the heatmap, right column the bars
+        fig = Figure(figsize=(6.6, 1.9), dpi=100, facecolor=self.PANEL_BG)
+        gs = fig.add_gridspec(1, 2, width_ratios=[1, 3.1], wspace=0.28)
+
+        heat_ax = fig.add_subplot(gs[0])
+        heat_ax.set_facecolor(self.PANEL_BG)
+        heat_ax.axis("off")
+        # Seed with a blank placeholder; _next_sample will swap in the image.
+        blank = np.full((IMG_INPUT_SIZE, IMG_INPUT_SIZE, 3), 0.9, dtype=np.float32)
+        heat_base_im   = heat_ax.imshow(blank)                            # "raw" photo
+        heat_over_im   = heat_ax.imshow(blank, alpha=0.0)                 # overlay on top
+        heat_ax.set_title("where the model looked", fontsize=9, color="#777")
+
+        bar_ax = fig.add_subplot(gs[1])
+        bar_ax.set_facecolor(self.PANEL_BG)
+        bar_ax.set_xlim(0, 1.0)
+        bar_ax.set_yticks(range(len(self.class_names)))
+        bar_ax.set_yticklabels(self.class_names)
+        bar_ax.set_xlabel("softmax probability")
         for spine in ("top", "right"):
-            ax.spines[spine].set_visible(False)
-        bars = ax.barh(range(len(self.class_names)),
-                       [0] * len(self.class_names), color="#bbb")
+            bar_ax.spines[spine].set_visible(False)
+        bars = bar_ax.barh(range(len(self.class_names)),
+                           [0] * len(self.class_names), color="#bbb")
         text_labels = [
-            ax.text(0.005, i, "0.00", va="center", ha="left",
-                    fontsize=9, color="#333")
+            bar_ax.text(0.005, i, "0.00", va="center", ha="left",
+                        fontsize=9, color="#333")
             for i in range(len(self.class_names))
         ]
-        fig.tight_layout(pad=0.4)
+        fig.tight_layout(pad=0.6)
 
         canvas = FigureCanvasTkAgg(fig, master=frame)
         canvas.get_tk_widget().pack(fill="x", padx=10, pady=4)
@@ -298,8 +358,11 @@ class MushroomDemoApp:
 
         return dict(
             frame=frame, pred_var=pred_var, pred_lbl=pred_lbl,
-            fig=fig, ax=ax, canvas=canvas, bars=bars,
-            text_labels=text_labels, logits_var=logits_var,
+            fig=fig, heat_ax=heat_ax, bar_ax=bar_ax, canvas=canvas,
+            heat_base_im=heat_base_im, heat_over_im=heat_over_im,
+            bars=bars, text_labels=text_labels, logits_var=logits_var,
+            # Runtime state
+            original_data=blank,   # what the base imshow currently shows
         )
 
     # ── data flow ────────────────────────────────────────────────────────────
@@ -315,10 +378,15 @@ class MushroomDemoApp:
         self.current_label = label
         self.current_path = path
 
+        # Same [0,1] RGB array the heatmap overlay will be built on top of.
+        # We push this into both result panels so they always show the
+        # current mushroom even before a prediction has run.
+        current_arr = self.infer.original_array(self.current_pil)
+
         self._show_image(self.current_pil)
         self.truth_var.set(f"Ground truth:  {self.class_names[label]}")
-        self._reset_panel(self.cnn_panel)
-        self._reset_panel(self.vit_panel)
+        self._reset_panel(self.cnn_panel, current_arr)
+        self._reset_panel(self.vit_panel, current_arr)
         self.status_var.set("ready — choose a model")
 
     def _show_image(self, pil_img):
@@ -334,7 +402,7 @@ class MushroomDemoApp:
         self.image_canvas.delete("all")
         self.image_canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
 
-    def _reset_panel(self, panel):
+    def _reset_panel(self, panel, original_arr):
         panel["pred_var"].set("—")
         panel["pred_lbl"].config(fg="#555")
         for bar in panel["bars"]:
@@ -344,6 +412,11 @@ class MushroomDemoApp:
             t.set_text("")
             t.set_x(0.005)
         panel["logits_var"].set("logits: —")
+        # Heatmap layer: show the fresh image, hide the (stale) overlay.
+        panel["heat_base_im"].set_data(original_arr)
+        panel["heat_over_im"].set_data(original_arr)
+        panel["heat_over_im"].set_alpha(0.0)
+        panel["original_data"] = original_arr
         panel["canvas"].draw_idle()
 
     # ── inference (threaded so UI stays responsive) ──────────────────────────
@@ -375,13 +448,13 @@ class MushroomDemoApp:
             b.config(state="normal")
 
     def _show_results(self, results):
-        for tag, (logits, probs) in results.items():
+        for tag, (logits, probs, overlay) in results.items():
             panel = self.cnn_panel if tag == "cnn" else self.vit_panel
-            self._populate_panel(panel, logits, probs)
+            self._populate_panel(panel, logits, probs, overlay)
         self.status_var.set("done")
         self._reenable_buttons()
 
-    def _populate_panel(self, panel, logits, probs):
+    def _populate_panel(self, panel, logits, probs, overlay):
         pred_idx = int(np.argmax(probs))
         pred_name = self.class_names[pred_idx]
         true_name = self.class_names[self.current_label]
@@ -404,7 +477,12 @@ class MushroomDemoApp:
         panel["pred_var"].set(f"{pred_name}{tag}")
         panel["pred_lbl"].config(fg=colour)
 
-        # Animate bar fill from current width → final probability
+        # ── heatmap: push the new overlay into the top imshow layer, keep
+        # alpha at 0 for now so the animation can fade it in.
+        panel["heat_over_im"].set_data(overlay)
+        panel["heat_over_im"].set_alpha(0.0)
+
+        # ── bars: capture start/end widths and per-bar target colour
         start_widths = [b.get_width() for b in panel["bars"]]
         end_widths   = list(probs)
         bar_colours = [
@@ -419,13 +497,15 @@ class MushroomDemoApp:
 
         def step(frame_idx):
             t = frame_idx / ANIM_STEPS
-            # ease-out curve so it feels snappy
-            t_eased = 1 - (1 - t) ** 3
+            t_eased = 1 - (1 - t) ** 3          # cubic ease-out
+            # Bars fill horizontally …
             for i, bar in enumerate(panel["bars"]):
                 w = start_widths[i] + (end_widths[i] - start_widths[i]) * t_eased
                 bar.set_width(w)
                 panel["text_labels"][i].set_text(f"{w:.2f}")
                 panel["text_labels"][i].set_x(min(w + 0.01, 0.92))
+            # … and the heatmap fades in on top of the base image.
+            panel["heat_over_im"].set_alpha(t_eased)
             panel["canvas"].draw_idle()
             if frame_idx < ANIM_STEPS:
                 self.root.after(ANIM_INTERVAL_MS,
