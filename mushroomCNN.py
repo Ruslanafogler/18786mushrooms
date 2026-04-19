@@ -15,18 +15,11 @@ from PIL import Image
 
 
 
-
-
-
-
 ############################################################################
 ############################################################################
 
 class MushroomCNN(nn.Module):
-  '''
-  CNN fit for 227x227 pixel wide eRGB mushroom photos
-  
-  '''
+  # CNN fit for 227x227 pixel wide eRGB mushroom photos
 
   def __init__(self, 
                num_conv_blocks: int = 3, #num of conv stages

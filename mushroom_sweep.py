@@ -1,39 +1,8 @@
-"""
-mushroom_sweep.py
------------------
-Hyperparameter sweep for both the CNN and the ViT mushroom classifiers.
-
-Design choices:
-  • reuses `train_model` from mushroomMain so every config runs through the
-    exact same training loop, scheduler logic, and checkpoint format used
-    for the main models
-  • reuses Grad-CAM / attention-rollout primitives from mushroom_explain so
-    explainability is consistent with the stand-alone explanation script
-  • a *fixed* set of test samples is used across every config — rows in the
-    comparison montage show the same mushroom seen by each model, so the
-    heatmaps are directly comparable
-  • not exhaustive: 4 CNN and 4 ViT configurations hand-picked to probe
-    interesting axes (regularisation, depth, kernel/embedding size)
-
-Outputs (inside --output_dir):
-
-    sweep_results.csv / .json
-    sweep_summary_cnn.png                  ← accuracy + FNR bar charts
-    sweep_summary_vit.png
-    comparison_explanations_cnn.png        ← rows = samples, cols = configs
-    comparison_explanations_vit.png
-    <config_name>/
-        best_{cnn|vit}.pt
-        {CNN|ViT}_training_curves.png
-        {CNN|ViT}_val_confusion.png
-        {CNN|ViT}_test_confusion.png
-        explanations.png                   ← per-config heatmap panel
-
-Example:
-  python mushroom_sweep.py --data_dir ./data --output_dir ./sweep_out
-  python mushroom_sweep.py --data_dir ./data --arch vit --epochs 15
-  python mushroom_sweep.py --data_dir ./data --configs vit_baseline vit_less_reg
-"""
+# here is our sweep for the CNN, ViT, and ResNet mushroom stuff
+# usage ex:!!!
+#   python mushroom_sweep.py --data_dir ./data --output_dir ./sweep_out
+#   python mushroom_sweep.py --data_dir ./data --arch vit --epochs 15
+#   python mushroom_sweep.py --data_dir ./data --configs vit_baseline vit_less_reg
 
 import argparse
 import csv
@@ -49,14 +18,12 @@ from PIL import Image
 from torchvision import datasets, transforms
 from sklearn.metrics import confusion_matrix
 
-# Reuse training / data pipeline from mushroomMain
 from mushroomMain import (
     train_model,
     build_dataloaders,
     collect_predictions,
 )
 
-# Reuse explainability primitives from mushroom_explain
 from mushroom_explain import (
     GradCAM,
     vit_forward_with_attn,
@@ -67,14 +34,9 @@ from mushroom_explain import (
 
 from mushroomCNN import MushroomCNN
 from mushroomVIT import MushroomVIT
+from mushroomResNet import MushroomResNet
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sweep configurations
-# ─────────────────────────────────────────────────────────────────────────────
-# Each config is: {name, arch, model_kwargs, train_overrides}
-#   • model_kwargs override the MushroomCNN / MushroomVIT constructor defaults
-#   • train_overrides override lr / weight_decay / etc. for that config only
 
 CNN_CONFIGS = [
     dict(
@@ -106,6 +68,7 @@ CNN_CONFIGS = [
 
 VIT_CONFIGS = [
     dict(
+        #default parameter version
         name="vit_baseline",
         arch="vit",
         model_kwargs=dict(),
@@ -113,19 +76,20 @@ VIT_CONFIGS = [
     ),
     dict(
         name="vit_smaller",
-        # Smaller capacity — tests the "ViT is data-starved" hypothesis
+        #less heads and depth, smaller than baseline 
         arch="vit",
         model_kwargs=dict(embed_dim=128, num_heads=4, depth=4),
         train_overrides=dict(),
     ),
     dict(
         name="vit_less_reg",
-        # Tests the "ViT is underfitting" signal visible in the training curves
+        #less regularization versoin
         arch="vit",
         model_kwargs=dict(mlp_dropout=0.0, head_dropout=0.2),
         train_overrides=dict(),
     ),
     dict(
+        #MORE depth version
         name="vit_deeper",
         arch="vit",
         model_kwargs=dict(depth=8),
@@ -135,10 +99,46 @@ VIT_CONFIGS = [
 
 ALL_CONFIGS = CNN_CONFIGS + VIT_CONFIGS
 
+RESNET_CONFIGS = [
+    dict(
+        name="resnet_baseline",
+        arch="resnet",
+        model_kwargs=dict(preset="resnet18"),
+        train_overrides=dict(),
+    ),
+    dict(
+        name="resnet_light_reg",
+        #less regularization (dropout) just to see
+        arch="resnet",
+        model_kwargs=dict(preset="resnet18", head_dropout=0.3),
+        train_overrides=dict(),
+    ),
+    dict(
+        name="resnet_block_drop",
+        #MORE dropout but in the residual blocks :0 
+        arch="resnet",
+        model_kwargs=dict(preset="resnet18", block_dropout=0.1),
+        train_overrides=dict(),
+    ),
+    dict(
+        name="resnet_narrow",
+        #half the channel widths (reduce parameters), see if narrower has the same or less effect to check if our baseline is overkill
+        arch="resnet",
+        model_kwargs=dict(preset="resnet18", base_width=32),
+        train_overrides=dict(),
+    ),
+    dict(
+        name="resnet34",
+        #deeper  
+        arch="resnet",
+        model_kwargs=dict(preset="resnet34"),
+        train_overrides=dict(),
+    ),
+]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fixed-sample picker (same samples used for every config)
-# ─────────────────────────────────────────────────────────────────────────────
+ALL_CONFIGS = CNN_CONFIGS + VIT_CONFIGS + RESNET_CONFIGS
+
+
 
 def pick_fixed_samples(dataset, test_indices, num_samples, class_names, seed):
     """Balanced edible/poisonous sample of the test split, seeded for
@@ -162,17 +162,8 @@ def pick_fixed_samples(dataset, test_indices, num_samples, class_names, seed):
     return chosen
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Heatmap generation — delegates to mushroom_explain primitives
-# ─────────────────────────────────────────────────────────────────────────────
-
 def heatmap_for_sample(model, arch, x, gradcam=None):
-    """
-    Returns (heatmap_2d, logits, pred_idx).  Uses Grad-CAM for a CNN and
-    attention rollout for a ViT.  The GradCAM wrapper must be created once
-    per CNN model and reused across samples to keep hooks stable.
-    """
-    if arch == "cnn":
+    if arch in ("cnn", "resnet"):
         cam, logits, pred = gradcam(x)
         return cam, logits, pred
     else:
@@ -185,9 +176,7 @@ def heatmap_for_sample(model, arch, x, gradcam=None):
 
 def compute_heatmaps_for_config(model, arch, fixed_samples, dataset,
                                  transform, device, img_size):
-    """Run the model on every fixed sample, returning a list of
-    (heatmap_2d, logits, pred_idx, true_label, img_arr_01) tuples."""
-    gradcam = GradCAM(model, model.features) if arch == "cnn" else None
+    gradcam = GradCAM(model, model.features) if arch in ("cnn", "resnet") else None
     out = []
     try:
         for idx in fixed_samples:
@@ -208,10 +197,6 @@ def compute_heatmaps_for_config(model, arch, fixed_samples, dataset,
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Plotting
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _title_colour(pred_name, true_name):
     danger = pred_name.lower() == "edible" and true_name.lower() == "poisonous"
     if danger:   return "red",    "✗ DANGER"
@@ -220,7 +205,6 @@ def _title_colour(pred_name, true_name):
 
 
 def plot_per_config_explanation(heatmaps, class_names, title, out_path, img_size):
-    """Two columns per sample: original | heatmap overlay."""
     n = len(heatmaps)
     fig, axes = plt.subplots(n, 2, figsize=(7.5, 3.4 * n))
     if n == 1:
@@ -253,11 +237,6 @@ def plot_per_config_explanation(heatmaps, class_names, title, out_path, img_size
 
 def plot_comparison_montage(arch_label, config_heatmaps, class_names,
                              img_size, out_path):
-    """
-    Rows = samples, cols = [original, config1 heatmap, config2 heatmap, ...].
-    `config_heatmaps` is a dict {config_name: [per-sample heatmap dicts]}
-    where every value has the same samples in the same order.
-    """
     config_names = list(config_heatmaps.keys())
     if not config_names:
         return
@@ -306,9 +285,8 @@ def plot_comparison_montage(arch_label, config_heatmaps, class_names,
     plt.close()
     print(f"  saved → {out_path}")
 
-
+#make a bar chart for this
 def plot_sweep_summary(rows, arch_filter, out_path):
-    """Bar chart: test accuracy + poisonous FNR per config for a given arch."""
     grows = [r for r in rows if r["arch"] == arch_filter]
     if not grows:
         return
@@ -347,13 +325,11 @@ def plot_sweep_summary(rows, arch_filter, out_path):
     print(f"  saved → {out_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Single-config runner
-# ─────────────────────────────────────────────────────────────────────────────
-
 def build_model(cfg, num_classes, img_size):
     if cfg["arch"] == "cnn":
         return MushroomCNN(num_classes=num_classes, **cfg["model_kwargs"])
+    elif cfg["arch"] == "resnet":
+        return MushroomResNet(num_classes=num_classes, **cfg["model_kwargs"])
     else:
         return MushroomVIT(img_size=img_size,
                             num_classes=num_classes,
@@ -382,7 +358,7 @@ def run_config(cfg, base_args, train_loader, val_loader, test_loader,
     for k, v in cfg["train_overrides"].items():
         setattr(args_cfg, k, v)
 
-    tag = "CNN" if cfg["arch"] == "cnn" else "ViT"
+    tag = {"cnn": "CNN", "vit": "ViT", "resnet": "ResNet"}[cfg["arch"]]
     use_warmup = (cfg["arch"] == "vit")
 
     t0 = time.time()
@@ -401,13 +377,10 @@ def run_config(cfg, base_args, train_loader, val_loader, test_loader,
     )
     elapsed = time.time() - t0
 
-    # Reload best checkpoint (train_model already loaded it, but be explicit
-    # in case we reuse the model object later)
     ckpt_path = cfg_dir / f"best_{tag.lower()}.pt"
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
 
-    # Test-set metrics
     y_true, y_pred = collect_predictions(model, test_loader, device)
     cm = confusion_matrix(y_true, y_pred)
     acc = float((y_true == y_pred).mean())
@@ -419,7 +392,6 @@ def run_config(cfg, base_args, train_loader, val_loader, test_loader,
     precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
     recall    = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
 
-    # Explainability on the fixed sample set
     heatmaps = compute_heatmaps_for_config(
         model, cfg["arch"], fixed_samples, dataset,
         transform, device, base_args.img_size,
@@ -431,7 +403,7 @@ def run_config(cfg, base_args, train_loader, val_loader, test_loader,
         img_size=base_args.img_size,
     )
 
-    # Free the model — we've saved the checkpoint and cached the heatmaps
+    #Free the model 
     del model
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -456,9 +428,6 @@ def run_config(cfg, base_args, train_loader, val_loader, test_loader,
     return row, heatmaps
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -467,14 +436,12 @@ def parse_args():
     )
     p.add_argument("--data_dir",   required=True)
     p.add_argument("--output_dir", default="./sweep_out")
-    p.add_argument("--arch", choices=["cnn", "vit", "both"], default="both",
-                   help="Which architectures to sweep")
+    p.add_argument("--arch", choices=["cnn", "vit", "resnet", "both", "all"],
+                   default="all",
+                   help="Which architectures to sweep (both=cnn+vit, all=cnn+vit+resnet)")
     p.add_argument("--configs", nargs="+", default=None,
                    help="Run only the named configs (default: all for --arch)")
 
-    # Training defaults applied to every config unless that config overrides them.
-    # These match the mushroomMain.py defaults so the sweep baseline is the
-    # same regime the paper was trained under.
     p.add_argument("--epochs",        type=int,   default=12)
     p.add_argument("--patience",      type=int,   default=5)
     p.add_argument("--batch_size",    type=int,   default=32)
@@ -485,7 +452,7 @@ def parse_args():
     p.add_argument("--num_workers",   type=int,   default=4)
     p.add_argument("--seed",          type=int,   default=42)
 
-    # Explainability knobs
+    #explainability
     p.add_argument("--num_explain_samples", type=int, default=4,
                    help="Number of fixed test samples to explain per config")
     p.add_argument("--sample_seed", type=int, default=123,
@@ -511,6 +478,10 @@ def main():
         pool = CNN_CONFIGS
     elif args.arch == "vit":
         pool = VIT_CONFIGS
+    elif args.arch == "resnet":
+        pool = RESNET_CONFIGS
+    elif args.arch == "both":
+        pool = CNN_CONFIGS + VIT_CONFIGS
     if args.configs:
         wanted = set(args.configs)
         pool = [c for c in pool if c["name"] in wanted]
@@ -523,7 +494,7 @@ def main():
 
     print(f"Will run {len(pool)} config(s): {[c['name'] for c in pool]}\n")
 
-    # Shared dataloaders — all configs see the same split + augmentation
+    #shared dataloaders so the split and augments are the same 
     train_loader, val_loader, test_loader, class_names = build_dataloaders(
         data_dir=args.data_dir,
         img_size=args.img_size,
@@ -538,7 +509,6 @@ def main():
         (i for i, c in enumerate(class_names) if c.lower() == "poisonous"), 1
     )
 
-    # Reproduce the exact test split (index list) for picking fixed samples
     full_dataset = datasets.ImageFolder(args.data_dir)
     n = len(full_dataset)
     n_test = int(n * 0.15)
@@ -556,16 +526,14 @@ def main():
     )
     print(f"Fixed explain samples: {fixed_samples}")
 
-    # Transform used for explainability (deterministic, matches eval_tf in mushroomMain)
     explain_tf = transforms.Compose([
         transforms.Resize((args.img_size, args.img_size)),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    # ── run every config ────────────────────────────────────────────────────
     rows = []
-    heatmaps_by_config = {"cnn": {}, "vit": {}}
+    heatmaps_by_config = {"cnn": {}, "vit": {}, "resnet": {}}
 
     for i, cfg in enumerate(pool, 1):
         print(f"\n[{i}/{len(pool)}] ", end="")
@@ -578,12 +546,10 @@ def main():
         rows.append(row)
         heatmaps_by_config[cfg["arch"]][cfg["name"]] = heatmaps
 
-    # ── sweep outputs ───────────────────────────────────────────────────────
     print(f"\n{'═'*70}")
     print("  Sweep complete — writing summary outputs")
     print(f"{'═'*70}")
 
-    # sort by (arch, FNR asc, accuracy desc) for the CSV
     sorted_rows = sorted(
         rows,
         key=lambda r: (r["arch"], r["poisonous_fnr"], -r["test_accuracy"]),
@@ -605,22 +571,21 @@ def main():
     print(f"  saved → {out / 'sweep_results.csv'}")
     print(f"  saved → {out / 'sweep_results.json'}")
 
-    if any(r["arch"] == "cnn" for r in rows):
-        plot_sweep_summary(rows, "cnn", out / "sweep_summary_cnn.png")
-        plot_comparison_montage(
-            "CNN — Grad-CAM",
-            heatmaps_by_config["cnn"], class_names,
-            args.img_size, out / "comparison_explanations_cnn.png",
-        )
-    if any(r["arch"] == "vit" for r in rows):
-        plot_sweep_summary(rows, "vit", out / "sweep_summary_vit.png")
-        plot_comparison_montage(
-            "ViT — attention rollout",
-            heatmaps_by_config["vit"], class_names,
-            args.img_size, out / "comparison_explanations_vit.png",
-        )
+    for arch_key, arch_label, explain_label in [
+        ("cnn",    "cnn",    "CNN — Grad-CAM"),
+        ("vit",    "vit",    "ViT — attention rollout"),
+        ("resnet", "resnet", "ResNet — Grad-CAM"),
+    ]:
+        if any(r["arch"] == arch_key for r in rows):
+            plot_sweep_summary(rows, arch_key,
+                               out / f"sweep_summary_{arch_key}.png")
+            plot_comparison_montage(
+                explain_label,
+                heatmaps_by_config[arch_key], class_names,
+                args.img_size,
+                out / f"comparison_explanations_{arch_key}.png",
+            )
 
-    # ── printed leaderboard ─────────────────────────────────────────────────
     print("\nLeaderboard (sorted by FNR asc, then accuracy desc):")
     print(f"  {'config':<22} {'arch':>5} {'acc':>8} {'recall':>8} {'FNR':>7} "
           f"{'params':>10}")

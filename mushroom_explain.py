@@ -1,27 +1,17 @@
-"""
-mushroom_explain.py
--------------------
-Explainability analysis for the mushroom classifiers.
+# given trained CNN and ViT and Resnet checkpoints, this script:
+# samples a couple test images (correct & incorrect, edible & poisonous)
+# computes Grad-CAM for the CNN/Resenet 
+# computes attention rollout for the ViT 
+# saves a side-by-side panel per image,
+# annotates with predicted/true label and softmax probabilities
 
-Given trained CNN and ViT checkpoints, this script:
-  • picks a stratified set of test images (correct & incorrect, edible & poisonous)
-  • computes Grad-CAM for the CNN  — gradients × activations at the last conv stage
-  • computes attention rollout for the ViT — multi-layer CLS-token saliency
-  • saves a side-by-side panel per image:
-        [original | CNN Grad-CAM overlay | ViT attention overlay]
-    annotated with predicted/true label and softmax probabilities
-
-For a safety-critical classifier, knowing *why* it flagged a mushroom matters
-as much as knowing *what* it flagged.
-
-Example:
-  python mushroom_explain.py \\
-      --data_dir ./data \\
-      --cnn_ckpt ./mushroom_output/best_cnn.pt \\
-      --vit_ckpt ./mushroom_output/best_vit.pt \\
-      --output_dir ./explain_out \\
-      --num_samples 8
-"""
+#   USE CASE ex. goes:
+#   python mushroom_explain.py \\
+#       --data_dir ./data \\
+#       --cnn_ckpt ./mushroom_output/best_cnn.pt \\
+#       --vit_ckpt ./mushroom_output/best_vit.pt \\
+#       --output_dir ./explain_out \\
+#       --num_samples 8
 
 import argparse
 from pathlib import Path
@@ -36,18 +26,13 @@ from PIL import Image
 
 from mushroomCNN import MushroomCNN
 from mushroomVIT import MushroomVIT
+from mushroomResNet import MushroomResNet     
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CNN — Grad-CAM
-# ─────────────────────────────────────────────────────────────────────────────
 
 class GradCAM:
-    """
-    Grad-CAM on a chosen module's output.  We hook the module's forward output
-    (activations) and its backward gradient, then form
-        cam = ReLU( sum_c [ mean_xy(grad_c) * activation_c ] )
-    """
+    #form a RELU of the sum of backpropped gradients from a label and the last level
+    #cam = ReLU( sum [ mean(grad) * activation ] 
+    #this is supposed to highlight regions of interest that led to the model's choice!!!
     def __init__(self, model, target_module):
         self.model = model
         self.target = target_module
@@ -65,19 +50,18 @@ class GradCAM:
     def __call__(self, x, target_class=None):
         self.model.eval()
         self.model.zero_grad()
-        # Ensure the autograd graph reaches our hook by giving the input grad
         x = x.clone().detach().requires_grad_(True)
         logits = self.model(x)
         if target_class is None:
             target_class = int(logits.argmax(dim=1).item())
 
-        # Backprop only the target-class score so gradients reflect that class
+        # backprop only the target-class score (GET GRADIETNS FROM THE CLASS CHOICE)
         score = logits[0, target_class]
         score.backward(retain_graph=False)
 
-        # weights[c] = mean over spatial dims of grad on channel c
-        weights = self.gradients.mean(dim=(2, 3), keepdim=True)            # [1, C, 1, 1]
-        cam = (weights * self.activations).sum(dim=1).squeeze(0)            # [H, W]
+        #!!! weights are mean over spatial dims of grad on channel c
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)# [1, C, 1, 1]
+        cam = (weights * self.activations).sum(dim=1).squeeze(0)# [H, W]
         cam = F.relu(cam)
         cam = cam.detach().cpu().numpy()
         if cam.max() > 0:
@@ -89,19 +73,14 @@ class GradCAM:
         self._h2.remove()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ViT — attention rollout
-# ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def vit_forward_with_attn(vit, x):
-    """
-    Manually walk the ViT forward pass while capturing per-layer attention
-    weights.  We replicate MushroomVIT.forward but ask MultiheadAttention for
-    the weights (need_weights=True, average_attn_weights=False).
-    Returns (logits, attentions) where attentions is a list of
-        [B, num_heads, N+1, N+1] tensors, one per encoder block.
-    """
+    #Manually walk the ViT forward pass while capturing per-layer attention weights.  
+    #note that this therefore REPLICATES MushroomVIT.forward in our design :p
+    #but ask MultiheadAttention for the weights
+    #Returns (logits, attentions) where attentions is a list of
+    #[B, num_heads, N+1, N+1] tensors, one per encoder block.
     B = x.size(0)
     h = vit.patch_embed(x)
     cls = vit.cls_token.expand(B, -1, -1)
@@ -126,13 +105,9 @@ def vit_forward_with_attn(vit, x):
 
 
 def attention_rollout(attentions, head_fusion="mean", discard_ratio=0.0):
-    """
-    Abnar & Zuidema (2020) attention rollout.  Combines attention across all
-    layers, accounting for residual connections by adding identity, into a
-    single attention map showing where the CLS token effectively looked.
-
-    Returns a 2D numpy heatmap of shape (grid, grid).
-    """
+    #Abnar & Zuidema (2020) algorithm
+    #Combines attention across all layers, accounting for residual connections by adding identity, into a
+    #single attention map showing where the CLS token effectively looked.
     with torch.no_grad():
         N = attentions[0].size(-1)
         device = attentions[0].device
@@ -147,7 +122,7 @@ def attention_rollout(attentions, head_fusion="mean", discard_ratio=0.0):
             else:
                 raise ValueError(head_fusion)
 
-            # Optionally drop the lowest-attention edges (often noise)
+            #Optionally drop the lowest-attention edges
             if discard_ratio > 0:
                 flat = a.view(-1)
                 k = int(flat.numel() * discard_ratio)
@@ -155,21 +130,18 @@ def attention_rollout(attentions, head_fusion="mean", discard_ratio=0.0):
                     thr = flat.kthvalue(k).values
                     a = torch.where(a < thr, torch.zeros_like(a), a)
 
-            # Residual: add identity, renormalise rows
+            # RESIDUAL HANDLINGG, we add identity, renormalise rows
             a = a + torch.eye(N, device=device)
             a = a / a.sum(dim=-1, keepdim=True)
 
             result = a @ result
 
-        # CLS row, dropping the CLS-to-CLS entry, gives saliency over patches
+        #CLS token row, dropping the CLS-to-CLS entry, gives saliency over patches
         mask = result[0, 1:]
         grid = int(round(mask.numel() ** 0.5))
         return mask.reshape(grid, grid).cpu().numpy()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Visualisation helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def overlay_heatmap(img_rgb_01, heatmap, alpha=0.45, size=224):
     """Bilinearly upsample heatmap, normalise, jet-colour, blend with image."""
@@ -192,7 +164,6 @@ def annotate(ax, model_name, probs, pred_idx, true_idx, class_names):
     pred_name = class_names[pred_idx]
     true_name = class_names[true_idx]
     correct = pred_idx == true_idx
-    # Highlight the dangerous failure mode: predicted edible, actually poisonous
     danger = (pred_name.lower() == "edible") and (true_name.lower() == "poisonous")
 
     if danger:
@@ -211,30 +182,25 @@ def annotate(ax, model_name, probs, pred_idx, true_idx, class_names):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sample selection
-# ─────────────────────────────────────────────────────────────────────────────
 
-def pick_samples(dataset, indices, cnn, vit, transform, device, num_samples, class_names):
-    """
-    Run both models on the test split, then choose a balanced set of samples:
-    a mix of (correct edible, correct poisonous, incorrect edible, incorrect
-    poisonous), prioritising disagreements between models because those are the
-    most diagnostic cases for explainability.
-    """
-    # Cheap forward pass on every test image
+def pick_samples(dataset, indices, models, transform, device, num_samples, class_names):
+    model_names = list(models.keys())
+    for m in models.values():
+        m.eval()
+
     records = []
-    cnn.eval(); vit.eval()
     with torch.no_grad():
         for idx in indices:
             path, label = dataset.imgs[idx]
             img = Image.open(path).convert("RGB")
             x = transform(img).unsqueeze(0).to(device)
-            cnn_pred = int(cnn(x).argmax(dim=1).item())
-            vit_pred = int(vit(x).argmax(dim=1).item())
+            preds = {name: int(m(x).argmax(dim=1).item())
+                     for name, m in models.items()}
+            pred_vals = list(preds.values())
             records.append(dict(
                 idx=idx, path=path, label=label,
-                cnn_pred=cnn_pred, vit_pred=vit_pred,
-                disagree=(cnn_pred != vit_pred),
+                preds=preds,
+                disagree=len(set(pred_vals)) > 1,
             ))
 
     poison_idx = next((i for i, c in enumerate(class_names)
@@ -245,16 +211,19 @@ def pick_samples(dataset, indices, cnn, vit, transform, device, num_samples, cla
 
     half = max(1, num_samples // 4)
     chosen = []
-    chosen += take(lambda r: r["disagree"], half)                                       # disagreements
-    chosen += take(lambda r: r["label"] == poison_idx and r["cnn_pred"] != poison_idx,
-                   half)                                                                # CNN false negatives (most dangerous)
-    chosen += take(lambda r: r["label"] == poison_idx
-                              and r["cnn_pred"] == poison_idx
-                              and r["vit_pred"] == poison_idx, half)                    # both correct on poisonous
-    chosen += take(lambda r: r["label"] != poison_idx
-                              and r["cnn_pred"] == poison_idx, half)                    # CNN false positive (over-cautious)
+    #disagreements between any pair of models
+    chosen += take(lambda r: r["disagree"], half)
+    #any model gives a dangerous false negative
+    chosen += take(lambda r: r["label"] == poison_idx and
+                   any(p != poison_idx for p in r["preds"].values()), half)
+    #all models correct on poisonous
+    chosen += take(lambda r: r["label"] == poison_idx and
+                   all(p == poison_idx for p in r["preds"].values()), half)
+    #any model gives a false positive (over-cautious)
+    chosen += take(lambda r: r["label"] != poison_idx and
+                   any(p == poison_idx for p in r["preds"].values()), half)
 
-    # de-dup, preserve order, pad with arbitrary remaining records
+    #de-dup, preserve order, pad with arbitrary remaining records
     seen, uniq = set(), []
     for r in chosen + records:
         if r["idx"] in seen:
@@ -266,24 +235,61 @@ def pick_samples(dataset, indices, cnn, vit, transform, device, num_samples, cla
     return uniq[:num_samples]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+def compute_heatmap(model, model_name, x, gradcam_map):
+    #run one model on one image and return (logits, pred_idx, probs, overlay_data).
+    #gradcam_map` is a dict {model_name: GradCAM} for CNN-like models.
+    if model_name == "ViT":
+        logits_t, attns = vit_forward_with_attn(model, x)
+        logits = logits_t.detach().cpu().numpy()[0]
+        pred = int(np.argmax(logits))
+        probs = softmax(logits)
+        heatmap = attention_rollout(attns, head_fusion="mean", discard_ratio=0.1)
+        return logits, pred, probs, heatmap
+    else:
+        #CNN or ResNet — both expose model.features, use Grad-CAM
+        gc = gradcam_map[model_name]
+        cam, logits, pred = gc(x)
+        probs = softmax(logits)
+        return logits, pred, probs, cam
+
+
+def method_label(model_name):
+    # Human-readable explainability method name for plot titles
+    if model_name == "ViT":
+        return "ViT attention rollout"
+    return f"{model_name} Grad-CAM"
+
 
 def parse_args():
-    p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p = argparse.ArgumentParser(
+        description="Explainability analysis for mushroom classifiers (CNN / ViT / ResNet)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     p.add_argument("--data_dir",   required=True)
-    p.add_argument("--cnn_ckpt",   required=True)
-    p.add_argument("--vit_ckpt",   required=True)
     p.add_argument("--output_dir", default="./explain_out")
     p.add_argument("--num_samples", type=int, default=8)
     p.add_argument("--img_size",    type=int, default=224)
     p.add_argument("--seed",        type=int, default=42)
-    # Model hyperparameters — must match training (defaults match mushroomMain.py)
+
+    # Checkpoints — all optional, provide whichever you have
+    p.add_argument("--cnn_ckpt",    default=None,
+                   help="Path to best_cnn.pt (omit to skip CNN)")
+    p.add_argument("--vit_ckpt",    default=None,
+                   help="Path to best_vit.pt (omit to skip ViT)")
+    p.add_argument("--resnet_ckpt", default=None,
+                   help="Path to best_resnet.pt (omit to skip ResNet)")
+
+    # ViT model hyperparameters — must match training
     p.add_argument("--patch_size",  type=int, default=16)
     p.add_argument("--embed_dim",   type=int, default=256)
     p.add_argument("--num_heads",   type=int, default=8)
     p.add_argument("--depth",       type=int, default=6)
+
+    # ResNet model hyperparameters — must match training
+    p.add_argument("--resnet_preset", default="resnet18",
+                   choices=["resnet18", "resnet34", "resnet50"])
+    p.add_argument("--resnet_base_width", type=int, default=64)
+
     return p.parse_args()
 
 
@@ -299,16 +305,16 @@ def main():
     )
     print(f"Device: {device}")
 
-    # Eval transform — must match training-time eval pipeline exactly
+    #we must match training-time eval pipeline exactly
     transform = transforms.Compose([
         transforms.Resize((args.img_size, args.img_size)),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    # Reproduce the same train/val/test split the training script used
     full = datasets.ImageFolder(args.data_dir)
     class_names = full.classes
+    nc = len(class_names)
     n = len(full)
     n_test = int(n * 0.15)
     n_val  = int(n * 0.15)
@@ -320,35 +326,65 @@ def main():
     test_indices = test_split.indices
     print(f"Test set: {len(test_indices)} images.  classes: {class_names}")
 
-    # Models
-    cnn = MushroomCNN(num_classes=len(class_names)).to(device)
-    cnn.load_state_dict(torch.load(args.cnn_ckpt, map_location=device))
-    cnn.eval()
+    models = {}        
+    gradcam_map = {}   
 
-    vit = MushroomVIT(
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        embed_dim=args.embed_dim,
-        num_heads=args.num_heads,
-        depth=args.depth,
-        num_classes=len(class_names),
-    ).to(device)
-    vit.load_state_dict(torch.load(args.vit_ckpt, map_location=device))
-    vit.eval()
+    if args.cnn_ckpt:
+        cnn = MushroomCNN(num_classes=nc).to(device)
+        cnn.load_state_dict(torch.load(args.cnn_ckpt, map_location=device))
+        cnn.eval()
+        models["CNN"] = cnn
+        gradcam_map["CNN"] = GradCAM(cnn, cnn.features)
+        print(f"  loaded CNN  ({sum(p.numel() for p in cnn.parameters()):,} params)")
 
-    # Grad-CAM target: output of the full conv feature stack (just before global pool)
-    gradcam = GradCAM(cnn, cnn.features)
+    if args.vit_ckpt:
+        vit = MushroomVIT(
+            img_size=args.img_size,
+            patch_size=args.patch_size,
+            embed_dim=args.embed_dim,
+            num_heads=args.num_heads,
+            depth=args.depth,
+            num_classes=nc,
+        ).to(device)
+        vit.load_state_dict(torch.load(args.vit_ckpt, map_location=device))
+        vit.eval()
+        models["ViT"] = vit
+        print(f"  loaded ViT  ({sum(p.numel() for p in vit.parameters()):,} params)")
 
-    # Pick samples
-    samples = pick_samples(full, test_indices, cnn, vit,
+    if args.resnet_ckpt:
+        resnet = MushroomResNet(
+            preset=args.resnet_preset,
+            base_width=args.resnet_base_width,
+            num_classes=nc,
+        ).to(device)
+        resnet.load_state_dict(torch.load(args.resnet_ckpt, map_location=device))
+        resnet.eval()
+        models["ResNet"] = resnet
+        gradcam_map["ResNet"] = GradCAM(resnet, resnet.features)
+        print(f"  loaded ResNet ({sum(p.numel() for p in resnet.parameters()):,} params)")
+
+    if not models:
+        raise SystemExit(
+            "No checkpoints provided.  Pass at least one of "
+            "--cnn_ckpt, --vit_ckpt, --resnet_ckpt."
+        )
+
+    model_names = list(models.keys())
+    print(f"\nModels ready: {model_names}")
+
+    samples = pick_samples(full, test_indices, models,
                             transform, device, args.num_samples, class_names)
     print(f"Selected {len(samples)} samples for explanation.")
 
-    # Build the explanation grid
+    #build grid
     n_rows = len(samples)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(11, 3.4 * n_rows))
+    n_cols = 1 + len(model_names)
+    fig, axes = plt.subplots(n_rows, n_cols,
+                              figsize=(3.6 * n_cols, 3.4 * n_rows))
     if n_rows == 1:
         axes = axes[np.newaxis, :]
+    if n_cols == 1:
+        axes = axes[:, np.newaxis]
 
     for row, rec in enumerate(samples):
         img_pil = Image.open(rec["path"]).convert("RGB")
@@ -357,34 +393,20 @@ def main():
 
         x = transform(img_pil).unsqueeze(0).to(device)
 
-        # CNN: Grad-CAM on the predicted class (so the heatmap explains *that* call)
-        cam, cnn_logits, cnn_pred = gradcam(x)
-        cnn_overlay = overlay_heatmap(img_arr, cam, size=args.img_size)
-        cnn_probs = softmax(cnn_logits)
-
-        # ViT: forward + rollout
-        vit_logits_t, attentions = vit_forward_with_attn(vit, x)
-        vit_logits = vit_logits_t.detach().cpu().numpy()[0]
-        vit_pred = int(np.argmax(vit_logits))
-        roll = attention_rollout(attentions, head_fusion="mean", discard_ratio=0.1)
-        vit_overlay = overlay_heatmap(img_arr, roll, size=args.img_size)
-        vit_probs = softmax(vit_logits)
-
-        # Plot — col 0: original, col 1: CNN Grad-CAM, col 2: ViT attention
         true_name = class_names[rec["label"]]
         axes[row, 0].imshow(img_arr)
         axes[row, 0].set_title(f"original — true: {true_name}", fontsize=10)
         axes[row, 0].axis("off")
 
-        axes[row, 1].imshow(cnn_overlay)
-        annotate(axes[row, 1], "CNN Grad-CAM", cnn_probs, cnn_pred,
-                  rec["label"], class_names)
-        axes[row, 1].axis("off")
+        for col, name in enumerate(model_names, start=1):
+            logits, pred, probs, heatmap = compute_heatmap(
+                models[name], name, x, gradcam_map)
+            overlay = overlay_heatmap(img_arr, heatmap, size=args.img_size)
 
-        axes[row, 2].imshow(vit_overlay)
-        annotate(axes[row, 2], "ViT attention rollout", vit_probs, vit_pred,
-                  rec["label"], class_names)
-        axes[row, 2].axis("off")
+            axes[row, col].imshow(overlay)
+            annotate(axes[row, col], method_label(name), probs, pred,
+                      rec["label"], class_names)
+            axes[row, col].axis("off")
 
     plt.tight_layout()
     fig_path = out / "explanations.png"
@@ -392,7 +414,8 @@ def main():
     plt.close()
     print(f"Saved explanation grid → {fig_path}")
 
-    gradcam.remove()
+    for gc in gradcam_map.values():
+        gc.remove()
 
 
 if __name__ == "__main__":

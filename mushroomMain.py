@@ -16,6 +16,7 @@ import math
 
 from mushroomCNN import MushroomCNN
 from mushroomVIT import MushroomVIT
+from mushroomResNet import MushroomResNet
 
 
 class _DatasetWithTransform(torch.utils.data.Dataset):
@@ -328,8 +329,9 @@ def parse_args():
     )
  
     # ── which model(s) to run ────────────────────────────────────────────────
-    p.add_argument("--model", choices=["cnn", "vit", "both"], default="both",
-                   help="Which model to train: cnn, vit, or both")
+    p.add_argument("--model", choices=["cnn", "vit", "resnet", "both", "all"],
+                   default="all",
+                   help="Which model to train: cnn, vit, resnet, both (cnn+vit), or all")
  
     # ── paths ────────────────────────────────────────────────────────────────
     p.add_argument("--data_dir",   required=True,
@@ -385,6 +387,18 @@ def parse_args():
     vit.add_argument("--mlp_dropout",  type=float, default=0.1)
     vit.add_argument("--head_dropout", type=float, default=0.5)
  
+    # ── ResNet-specific ───────────────────────────────────────────────────────
+    rn = p.add_argument_group("ResNet hyperparameters")
+    rn.add_argument("--resnet_preset",   choices=["resnet18", "resnet34", "resnet50"],
+                    default="resnet18",
+                    help="ResNet variant (block type + layer counts)")
+    rn.add_argument("--resnet_base_width", type=int,   default=64,
+                    help="Base channel width for the first stage")
+    rn.add_argument("--resnet_block_dropout", type=float, default=0.0,
+                    help="Dropout inside each residual block")
+    rn.add_argument("--resnet_head_dropout",  type=float, default=0.5,
+                    help="Dropout before the final classification layer")
+ 
     return p.parse_args()
  
  
@@ -396,7 +410,7 @@ def main():
     args = parse_args()
  
     # validate ViT constraints before doing anything
-    if args.model in ("vit", "both"):
+    if args.model in ("vit", "both", "all"):
         assert args.img_size % args.patch_size == 0, (
             f"--img_size {args.img_size} must be divisible by --patch_size {args.patch_size}"
         )
@@ -433,7 +447,7 @@ def main():
     print(f"Positive class (poisonous) index: {poisonous_idx}")
  
     # ── CNN ──────────────────────────────────────────────────────────────────
-    if args.model in ("cnn", "both"):
+    if args.model in ("cnn", "both", "all"):
         cnn = MushroomCNN(
             num_conv_blocks=args.num_conv_blocks,
             base_filters=args.base_filters,
@@ -467,7 +481,7 @@ def main():
         )
  
     # ── ViT ──────────────────────────────────────────────────────────────────
-    if args.model in ("vit", "both"):
+    if args.model in ("vit", "both", "all"):
         vit = MushroomVIT(
             img_size=args.img_size,
             patch_size=args.patch_size,
@@ -501,6 +515,34 @@ def main():
             out=out,
             args=args,
             use_warmup=True,
+        )
+ 
+    # ── ResNet ───────────────────────────────────────────────────────────────
+    if args.model in ("resnet", "all"):
+        resnet = MushroomResNet(
+            preset=args.resnet_preset,
+            base_width=args.resnet_base_width,
+            block_dropout=args.resnet_block_dropout,
+            head_dropout=args.resnet_head_dropout,
+            num_classes=len(class_names),
+        ).to(device)
+ 
+        print(f"\nResNet preset   : {args.resnet_preset}")
+        print(f"ResNet parameters: {sum(p.numel() for p in resnet.parameters() if p.requires_grad):,}")
+        print(resnet)
+ 
+        train_model(
+            model=resnet,
+            model_tag="ResNet",
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            class_names=class_names,
+            poisonous_idx=poisonous_idx,
+            device=device,
+            out=out,
+            args=args,
+            use_warmup=False,
         )
  
     print(f"\nAll outputs saved to: {out.resolve()}")
